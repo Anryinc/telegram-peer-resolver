@@ -1,22 +1,27 @@
 # Telegram Peer Resolver
 
-Сервис для получения **peer ID** по ссылке или username в Telegram.
+Сервис для получения **peer ID** по ссылке вида `t.me/username` (и других Telegram-ссылок).
 
 Предназначен для вызова из существующих ботов / бэкендов. **Это не бот**.
 
+Работает только через официальный **Bot API**. Не нужны `API_ID` / `API_HASH` и my.telegram.org.
+
 ## Как работает
 
-Принимает ссылку (`https://t.me/username`, `t.me/username`, `@username`, `tg://resolve?domain=...`, ссылки вида `t.me/c/...`) и возвращает числовой **peer_id** в формате Bot API:
+Принимает:
+- `https://t.me/username`
+- `t.me/username`
+- `@username`
+- `username`
+- `t.me/c/123456789/42` (для этих ссылок токен даже не нужен)
 
-- Пользователи / боты → положительное число
-- Обычные группы → отрицательное число
-- Каналы / супергруппы → число вида `-100xxxxxxxxxx`
+Возвращает числовой **peer_id** в формате Bot API.
 
-## Эндпоинты
+## Эндпоинт
 
-### `GET /resolve?link=...`
-
-Параметр `link` — любая Telegram-ссылка или username.
+```
+GET /resolve?link=https://t.me/username
+```
 
 Пример ответа:
 
@@ -29,50 +34,36 @@
 }
 ```
 
-### `GET /`
-
-Статус сервиса.
-
-### `GET /docs`
-
-Swagger UI.
-
 ## Настройка
 
-1. Получите `API_ID` и `API_HASH` на [my.telegram.org](https://my.telegram.org).
-2. Создайте бота у @BotFather и возьмите `BOT_TOKEN` (рекомендуется для простоты).
+Нужен только **BOT_TOKEN** любого существующего бота (от @BotFather).
 
-   Или используйте строку сессии пользовательского аккаунта (`SESSION_STRING`) — это надёжнее для произвольных пользователей.
+1. Скопируйте `.env.example` → `.env`
+2. Вставьте токен:
+   ```
+   BOT_TOKEN=123456:ABC-DEF...
+   ```
 
-3. Скопируйте `.env.example` в `.env` и заполните значения.
-
-## Запуск локально
+## Запуск
 
 ```bash
 pip install -r requirements.txt
-export API_ID=...
-export API_HASH=...
-export BOT_TOKEN=...
-# или SESSION_STRING=...
+export BOT_TOKEN=твой_токен
 uvicorn main:app --reload
 ```
 
-## Деплой
-
-Подходит для Railway, Render, Fly.io, Docker и т.д.
-
-Пример для Docker:
+Или через Docker:
 
 ```bash
 docker build -t tg-peer-resolver .
-docker run -p 8000:8000 -e API_ID=... -e API_HASH=... -e BOT_TOKEN=... tg-peer-resolver
+docker run -p 8000:8000 -e BOT_TOKEN=твой_токен tg-peer-resolver
 ```
 
 ## Ограничения
 
-- Для приватных чатов / пользователей без публичного username резолв может не сработать.
-- Telegram может ограничивать частые запросы (FloodWait). Добавьте кэш при необходимости.
-- Сервис использует MTProto (Telethon). Бот-токен подходит для большинства публичных сущностей.
+- Отлично работает с публичными каналами, группами и ботами.
+- Для обычных пользователей Telegram часто возвращает «chat not found», если бот с ними раньше не общался. Это ограничение самого Telegram.
+- Ссылки `t.me/c/...` работают без токена.
 
 ## Лицензия
 

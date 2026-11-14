@@ -2,66 +2,37 @@ import os
 import re
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from telethon import TelegramClient, utils
-from telethon.sessions import StringSession
-from telethon.tl.types import User, Chat, Channel
 
 load_dotenv()
 
 app = FastAPI(
     title="Telegram Peer Resolver",
-    description="Резолв Telegram-ссылок и username в peer ID (Bot API формат). Не бот.",
-    version="1.0.0",
+    description="Резолв Telegram-ссылок (t.me/username и др.) в peer ID через Bot API. Не бот.",
+    version="2.0.0",
 )
 
-API_ID = int(os.getenv("API_ID") or 0)
-API_HASH = os.getenv("API_HASH") or ""
 BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
-SESSION_STRING = os.getenv("SESSION_STRING") or ""
-
-client: Optional[TelegramClient] = None
-
-
-@app.on_event("startup")
-async def startup_event():
-    global client
-    if not API_ID or not API_HASH:
-        raise RuntimeError("API_ID и API_HASH обязательны")
-
-    if BOT_TOKEN:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.start(bot_token=BOT_TOKEN)
-    elif SESSION_STRING:
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        await client.start()
-    else:
-        raise RuntimeError("Укажите BOT_TOKEN или SESSION_STRING")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if client and client.is_connected():
-        await client.disconnect()
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 
 def extract_username_or_special(link: str) -> tuple[str, Optional[int]]:
-    """Возвращает (username_or_clean, special_channel_id_if_tme_c)"""
+    """Возвращает (username, special_channel_id_if_tme_c)"""
     link = link.strip()
     if not link:
         raise ValueError("Пустая ссылка")
 
-    # t.me/c/CHANNEL_ID/MSG_ID или похожие
+    # t.me/c/CHANNEL_ID/... — ID уже в ссылке
     c_match = re.search(r"t\.me/c/(\d+)", link, re.IGNORECASE)
     if c_match:
-        channel_id = int(c_match.group(1))
-        return "", channel_id
+        return "", int(c_match.group(1))
 
-    # Обычные случаи
+    # Очистка до username
     link = link.replace("https://", "").replace("http://", "")
     link = link.replace("t.me/", "").replace("telegram.me/", "")
-    if link.startswith("tg://resolve?domain="):
+    if "domain=" in link:
         link = link.split("domain=", 1)[1].split("&")[0]
     link = link.lstrip("@").split("?")[0].split("/")[0]
 
@@ -71,46 +42,60 @@ def extract_username_or_special(link: str) -> tuple[str, Optional[int]]:
     return link, None
 
 
-def entity_to_info(entity) -> dict:
-    peer_id = utils.get_peer_id(entity)
-    info = {"peer_id": peer_id}
+async def resolve_via_bot_api(username: str) -> dict:
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="BOT_TOKEN не задан")
 
-    if isinstance(entity, User):
-        info["type"] = "bot" if entity.bot else "user"
-        info["title"] = " ".join(filter(None, [entity.first_name, entity.last_name])).strip() or None
-        info["username"] = entity.username
-    elif isinstance(entity, Chat):
-        info["type"] = "group"
-        info["title"] = entity.title
-        info["username"] = None
-    elif isinstance(entity, Channel):
-        info["type"] = "channel" if entity.broadcast else "supergroup"
-        info["title"] = entity.title
-        info["username"] = entity.username
-    else:
-        info["type"] = type(entity).__name__.lower()
-        info["title"] = getattr(entity, "title", None)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # getChat принимает @username или username
+        resp = await client.get(f"{API_BASE}/getChat", params={"chat_id": f"@{username}"})
+        data = resp.json()
 
-    return info
+    if not data.get("ok"):
+        description = data.get("description", "unknown error")
+        if "chat not found" in description.lower() or "not found" in description.lower():
+            raise HTTPException(status_code=404, detail="Сущность не найдена или недоступна")
+        raise HTTPException(status_code=400, detail=f"Telegram API: {description}")
+
+    result = data["result"]
+    peer_id = result["id"]
+    chat_type = result.get("type", "unknown")
+
+    # Приводим тип к понятному виду
+    type_map = {
+        "private": "user",
+        "group": "group",
+        "supergroup": "supergroup",
+        "channel": "channel",
+    }
+    friendly_type = type_map.get(chat_type, chat_type)
+
+    title = result.get("title") or result.get("first_name")
+    if result.get("last_name"):
+        title = f"{title or ''} {result['last_name']}".strip()
+
+    return {
+        "peer_id": peer_id,
+        "type": friendly_type,
+        "title": title,
+        "username": result.get("username"),
+    }
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Telegram Peer Resolver", "docs": "/docs"}
+    return {"status": "ok", "message": "Telegram Peer Resolver (Bot API)", "docs": "/docs"}
 
 
 @app.get("/resolve")
 async def resolve(
-    link: str = Query(..., description="Ссылка Telegram или @username / username"),
+    link: str = Query(..., description="Ссылка вида t.me/username, https://t.me/username, @username или t.me/c/..."),
 ):
-    if client is None or not client.is_connected():
-        raise HTTPException(status_code=503, detail="Telegram client не инициализирован")
-
     try:
         username, special_channel_id = extract_username_or_special(link)
 
+        # Специальный случай — ID уже в ссылке, токен не нужен
         if special_channel_id is not None:
-            # Для ссылок вида t.me/c/XXXX/YYYY — ID уже в ссылке
             peer_id = int(f"-100{special_channel_id}")
             return {
                 "peer_id": peer_id,
@@ -120,16 +105,14 @@ async def resolve(
                 "source": "link_c",
             }
 
-        entity = await client.get_entity(username)
-        return entity_to_info(entity)
+        return await resolve_via_bot_api(username)
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        msg = str(e)
-        if "No user has" in msg or "Cannot find any entity" in msg or "Username not occupied" in msg:
-            raise HTTPException(status_code=404, detail="Сущность не найдена")
-        raise HTTPException(status_code=400, detail=f"Ошибка резолва: {msg}")
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {e}")
 
 
 if __name__ == "__main__":
